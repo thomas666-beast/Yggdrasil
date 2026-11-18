@@ -1,0 +1,12 @@
+0.03  Seed data
+      - Add standalone seeder scaffolding and execution by named connection.
+      - Validate seed files before a batch and run its data writes in one transaction.
+
+0.02  First standalone release
+      - Remove the framework dependency and introduce Yggdrasil::Collection.
+      - Add explicitly bound model APIs for named connections and multiple managers.
+      - Add keyset pagination without COUNT and validate offset pagination inputs.
+      - Keep mandatory soft-delete, relationship and cursor scopes separate from user ORs.
+      - Reject unsafe write shapes and accidental stored primary-key changes.
+      - Improve transaction failure handling, pivot sync and migration previews.
+      - Redact bindings in callback logs by default and select DBD::MariaDB explicitly.
