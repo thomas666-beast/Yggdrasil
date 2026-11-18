@@ -1,6 +1,7 @@
 package Yggdrasil::Migrator;
 use Moo;
 use Carp ();
+use Fcntl qw(O_WRONLY O_CREAT LOCK_EX LOCK_NB);
 use File::Path ();
 use File::Spec ();
 use POSIX ();
@@ -22,7 +23,7 @@ sub ensure_repository {
   $schema->create($s->table, sub {
     my $t = shift;
     $t->id;
-    $t->string('migration');
+    $t->string('migration')->unique;
     $t->integer('batch');
   });
 }
@@ -78,7 +79,8 @@ sub _load {
     Carp::croak("Yggdrasil: error in migration $name: $@") if $@;
     Carp::croak("Yggdrasil: cannot read migration $name: $!") unless defined $m;
     Carp::croak("Yggdrasil: migration $name must return { up => sub, down => sub }")
-      unless blessed $m || (ref $m eq 'HASH' && ref $m->{up} eq 'CODE' && ref $m->{down} eq 'CODE');
+      unless (blessed($m) && $m->can('up') && $m->can('down'))
+          || (ref $m eq 'HASH' && ref $m->{up} eq 'CODE' && ref $m->{down} eq 'CODE');
     $m;
   };
 }
@@ -94,7 +96,58 @@ sub _tx {
   return $s->connection->grammar->supports_ddl_transactions ? $s->connection->transaction($cb) : $cb->();
 }
 
+sub _with_lock {
+  my ($s, $code) = @_;
+  return $code->() if $s->{_migration_holds};
+  my $db = $s->connection;
+  Carp::croak('Yggdrasil: migration runner requires its own database session')
+    if $db->_level || $db->_pinned || $db->_pretend;
+  my $dbh = $db->dbh;
+  Carp::croak('Yggdrasil: migration runner requires AutoCommit') unless $dbh->{AutoCommit};
+  my ($file, $release);
+  my $dsn = 'yggdrasil:migrations';
+  if ($db->driver eq 'sqlite') {
+    my ($main) = grep { $_->{name} eq 'main' } @{$dbh->selectall_arrayref('pragma database_list', {Slice => {}})};
+    if ($main && length($main->{file} // '')) {
+      my $path = $main->{file} . '.yggdrasil-migrate.lock';
+      sysopen $file, $path, O_WRONLY | O_CREAT, 0600
+        or Carp::croak("Yggdrasil: cannot open migration lock '$path': $!");
+      flock $file, LOCK_EX | LOCK_NB or Carp::croak('Yggdrasil: migration lock is busy');
+    }
+  } elsif ($db->driver eq 'pg') {
+    my ($scope) = $dbh->selectrow_array('select current_schema()');
+    Carp::croak('Yggdrasil: migration lock requires an active schema') unless defined $scope;
+    my ($locked) = $dbh->selectrow_array('select pg_try_advisory_lock(hashtext(?), hashtext(?))', undef, $scope, $dsn);
+    Carp::croak('Yggdrasil: migration lock is busy') unless $locked && $locked ne 'f';
+    $release = sub { $dbh->selectrow_array('select pg_advisory_unlock(hashtext(?), hashtext(?))', undef, $scope, $dsn) };
+  } else {
+    my ($schema) = $dbh->selectrow_array('select database()');
+    Carp::croak('Yggdrasil: migration lock requires an active database') unless defined $schema;
+    my ($name) = $dbh->selectrow_array('select sha2(concat(?, char(0), ?), 256)', undef, $schema, $dsn);
+    my ($locked) = $dbh->selectrow_array('select get_lock(?, 0)', undef, $name);
+    Carp::croak('Yggdrasil: migration lock is busy or unavailable') unless $locked;
+    $release = sub { $dbh->selectrow_array('select release_lock(?)', undef, $name) };
+  }
+  local $s->{_migration_holds} = 1;
+  $db->_pinned(1);
+  my ($result, $error);
+  my $ok = eval { $result = $code->(); 1 };
+  $error = $@;
+  my $released = !$release || eval { my $r = $release->(); $r && $r ne 'f' };
+  $db->_pinned(undef);
+  eval { $db->_discard_connection } unless $released;
+  die $error unless $ok;
+  Carp::croak('Yggdrasil: migration ran but its lock could not be explicitly released') unless $released;
+  return $result;
+}
+
 sub run {
+  my ($s, %o) = @_;
+  return $s->_run(%o) if $o{pretend};
+  return $s->_with_lock(sub { $s->_run(%o) });
+}
+
+sub _run {
   my ($s, %o) = @_;
   my @pending = @{$s->pending};
   return [] unless @pending;
@@ -123,6 +176,12 @@ sub run {
 
 sub rollback {
   my ($s, %o) = @_;
+  return $s->_rollback(%o) if $o{pretend};
+  return $s->_with_lock(sub { $s->_rollback(%o) });
+}
+
+sub _rollback {
+  my ($s, %o) = @_;
   my @rows = reverse @{$s->_ran_rows};
   return [] unless @rows;
   if    ($o{all})  { }
@@ -148,14 +207,23 @@ sub reset   { my ($s, %o) = @_; $s->rollback(%o, all => 1) }
 sub refresh {
   my ($s, %o) = @_;
   Carp::croak('Yggdrasil: refresh does not support pretend mode') if $o{pretend};
-  $s->reset;
-  return $s->run(%o);
+  return $s->_with_lock(sub { $s->reset; $s->_run(%o) });
 }
 sub fresh {
   my ($s, %o) = @_;
   Carp::croak('Yggdrasil: fresh does not support pretend mode') if $o{pretend};
-  $s->schema->drop_all_tables;
-  return $s->run(%o);
+  my $after = delete $o{after};
+  Carp::croak('Yggdrasil: fresh after callback must be a coderef')
+    if defined $after && ref $after ne 'CODE';
+  return $s->_with_lock(sub {
+    my @files = sort keys %{$s->files};
+    Carp::croak('Yggdrasil: refusing fresh without migration files') unless @files;
+    $s->_load($_) for @files;
+    $s->schema->drop_all_tables;
+    my $ran = $s->_run(%o);
+    $after->($ran) if $after;
+    return $ran;
+  });
 }
 
 my %FIELD_TYPES = map { $_ => 1 } qw(string char text medium_text long_text integer big_integer

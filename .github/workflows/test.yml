@@ -1,0 +1,86 @@
+name: Perl database tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: SQLite
+          - engine: PostgreSQL
+            image: postgres:16
+            port: 5432
+            client: libpq-dev
+            module: DBD::Pg
+          - engine: MariaDB
+            image: mariadb:11.4
+            port: 3306
+            client: libmariadb-dev
+            module: DBD::MariaDB
+          - engine: Oracle MySQL
+            image: mysql:8.4
+            port: 3306
+            client: libmysqlclient-dev
+            module: DBD::mysql
+    name: ${{ matrix.engine }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start disposable database
+        if: matrix.image != ''
+        env:
+          IMAGE: ${{ matrix.image }}
+          PORT: ${{ matrix.port }}
+        run: |
+          docker run -d --name yggdrasil-qa -p "127.0.0.1:43306:$PORT" \
+            -e POSTGRES_DB=yggdrasil_qa -e POSTGRES_USER=fixture -e POSTGRES_PASSWORD=test-fixture-only \
+            -e MYSQL_DATABASE=yggdrasil_qa -e MYSQL_USER=fixture -e MYSQL_PASSWORD=test-fixture-only \
+            -e MYSQL_ROOT_PASSWORD=test-root-only "$IMAGE"
+      - name: Install Perl dependencies
+        env:
+          CLIENT: ${{ matrix.client }}
+          MODULE: ${{ matrix.module }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cpanminus ${CLIENT:+$CLIENT}
+          cpanm -n --mirror https://cpan.metacpan.org --mirror-only -l "$RUNNER_TEMP/ygg-local" --installdeps .
+          if [ -n "$MODULE" ]; then
+            cpanm -n --mirror https://cpan.metacpan.org --mirror-only -l "$RUNNER_TEMP/ygg-local" "$MODULE"
+          fi
+          printf 'PERL5LIB=%s/ygg-local/lib/perl5\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Run test suite
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: |
+          case "$ENGINE" in
+            PostgreSQL)
+              export YGGDRASIL_TEST_PG=postgresql://fixture:test-fixture-only@127.0.0.1:43306/yggdrasil_qa
+              url="$YGGDRASIL_TEST_PG" ;;
+            MariaDB)
+              export YGGDRASIL_TEST_MYSQL=mariadb://fixture:test-fixture-only@127.0.0.1:43306/yggdrasil_qa
+              url="$YGGDRASIL_TEST_MYSQL" ;;
+            "Oracle MySQL")
+              export YGGDRASIL_TEST_MYSQL=mysql://fixture:test-fixture-only@127.0.0.1:43306/yggdrasil_qa
+              export YGGDRASIL_TEST_MYSQL_TLS=1
+              url="$YGGDRASIL_TEST_MYSQL" ;;
+            SQLite) url='' ;;
+            *) exit 1 ;;
+          esac
+          if [ -n "$url" ]; then
+            perl -Ilib -MYggdrasil -e '
+              my $opt = $ENV{YGGDRASIL_TEST_MYSQL_TLS} ? {mysql_ssl => 1} : {};
+              for (1..60) {
+                exit 0 if eval { Yggdrasil->new(connections => {default => {url => $ARGV[0], options => $opt}})->db->select_one("select 1") };
+                warn $@ if $_ == 60;
+                sleep 2;
+              }
+              exit 1' "$url"
+          fi
+          prove -l t
+      - name: Database logs on failure
+        if: failure() && matrix.image != ''
+        run: docker logs yggdrasil-qa

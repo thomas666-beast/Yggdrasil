@@ -15,7 +15,7 @@ sub _do_delete {
   my $s = shift;
   my %v = ($s->deleted_at_column => $s->now);
   $v{$s->updated_at_column} = $v{$s->deleted_at_column} if $s->timestamps;
-  $s->_table_query->where($s->primary_key, $s->_stored_key)->update(\%v);
+  $s->_stored_query->update(\%v);
   @{$s->attributes}{keys %v} = values %v;
   @{$s->original}{keys %v}   = values %v;
 }
@@ -31,6 +31,7 @@ sub force_delete {
 
 sub restore {
   my $s = shift;
+  $s->_stored_key;
   $s->restoring;
   $s->attributes->{$s->deleted_at_column} = undef;
   $s->save;

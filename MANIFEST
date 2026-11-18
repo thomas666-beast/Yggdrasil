@@ -1,7 +1,9 @@
 Changes
+.github/workflows/test.yml
 MANIFEST
 Makefile.PL
 README.md
+USER-GUIDE.md
 bench/sqlite.pl
 cpanfile
 lib/Yggdrasil.pm
@@ -27,6 +29,7 @@ lib/Yggdrasil/Role/SoftDeletes.pm
 lib/Yggdrasil/Schema/Blueprint.pm
 lib/Yggdrasil/Schema/Builder.pm
 lib/Yggdrasil/Schema/Column.pm
+lib/Yggdrasil/Schema/Importer.pm
 lib/Yggdrasil/Seeder.pm
 lib/Yggdrasil/Util.pm
 t/01-grammar.t
@@ -34,5 +37,7 @@ t/10-orm.t
 t/11-extras.t
 t/15-core-contract.t
 t/16-seeder.t
+t/17-composite-key.t
+t/18-release-features.t
 META.yml                                 Module YAML meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)

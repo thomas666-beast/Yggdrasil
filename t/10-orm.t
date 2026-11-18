@@ -99,7 +99,8 @@ M
 # ---------------------------------------------------------------- the suite
 my %targets = (sqlite => { driver => 'sqlite', database => ':memory:' });
 $targets{pg}    = { url => $ENV{YGGDRASIL_TEST_PG} }    if $ENV{YGGDRASIL_TEST_PG};
-$targets{mysql} = { url => $ENV{YGGDRASIL_TEST_MYSQL} } if $ENV{YGGDRASIL_TEST_MYSQL};
+$targets{mysql} = { url => $ENV{YGGDRASIL_TEST_MYSQL},
+  options => $ENV{YGGDRASIL_TEST_MYSQL_TLS} ? { mysql_ssl => 1 } : {} } if $ENV{YGGDRASIL_TEST_MYSQL};
 
 for my $name (sort keys %targets) {
   subtest "driver: $name" => sub { run_suite($name, $targets{$name}) };

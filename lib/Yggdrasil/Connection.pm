@@ -24,6 +24,7 @@ has _pid      => (is => 'rw');
 has _used     => (is => 'rw', default => sub { 0 });
 has _level    => (is => 'rw', default => sub { 0 });
 has _pretend  => (is => 'rw');
+has _pinned   => (is => 'rw');
 
 sub _build_driver {
   my $s = shift;
@@ -105,6 +106,12 @@ sub _connect {
   my $dbh = DBI->connect($s->_connect_info)
     or Yggdrasil::Exception->throw(message => "Yggdrasil: cannot connect to '" . $s->name . "': " . ($DBI::errstr // 'unknown error'), type => 'connection');
   $s->_after_connect($dbh);
+  if ($s->driver eq 'mysql') {
+    my $reconnect = lc($dbh->{Driver}{Name}) eq 'mariadb' ? 'mariadb_auto_reconnect' : 'mysql_auto_reconnect';
+    # The ORM owns reconnection: a driver-level reconnect can silently lose
+    # transactions, session settings and advisory locks.
+    $dbh->{$reconnect} = 0 if $dbh->{$reconnect};
+  }
   $s->_dbh($dbh);
   $s->_pid($$);
   $s->_level(0);
@@ -142,10 +149,12 @@ sub dbh {
     $dbh = undef;
     $s->_dbh(undef);
     Carp::croak('Yggdrasil: transaction cannot continue in a forked process') if $s->_level;
+    Carp::croak('Yggdrasil: pinned session cannot continue in a forked process') if $s->_pinned;
   }
   $dbh = undef if $dbh && !$dbh->{Active};
   Carp::croak('Yggdrasil: lost connection during transaction; refusing to reconnect') if !$dbh && $s->_level;
-  if ($dbh && !$s->_level && time - $s->_used > ($s->config->{ping_interval} // 60)) {
+  Carp::croak('Yggdrasil: lost pinned session; refusing to reconnect') if !$dbh && $s->_pinned;
+  if ($dbh && !$s->_level && !$s->_pinned && time - $s->_used > ($s->config->{ping_interval} // 60)) {
     $dbh = undef unless $dbh->ping;
   }
   $dbh ||= $s->_connect;
@@ -156,6 +165,7 @@ sub dbh {
 sub disconnect {
   my $s = shift;
   Carp::croak('Yggdrasil: cannot disconnect during a transaction') if $s->_level;
+  Carp::croak('Yggdrasil: cannot disconnect a pinned session') if $s->_pinned;
   $s->_discard_connection;
 }
 

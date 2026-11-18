@@ -7,10 +7,8 @@ sub results { $_[0]->get }
 
 sub eager_load {
   my ($s, $models, $name, $cb) = @_;
-  local $s->{_cb} = $cb;
-  my $by = $s->_group($models);
-  my $lk = $s->local_key;
-  $_->set_relation($name, Yggdrasil::Collection->new(@{$by->{$_->attributes->{$lk} // ''} // []})) for @$models;
+  my ($by, $local) = $s->_group($models, $cb);
+  $_->set_relation($name, Yggdrasil::Collection->new(@{$s->_group_for($by, $_, $local)})) for @$models;
 }
 
 1;

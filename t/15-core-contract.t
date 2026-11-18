@@ -38,7 +38,8 @@ use JSON::PP ();
 my $sqlite = { driver => 'sqlite', database => ':memory:' };
 my @targets = (['SQLite', $sqlite]);
 push @targets, ['PostgreSQL', { url => $ENV{YGGDRASIL_TEST_PG} }] if $ENV{YGGDRASIL_TEST_PG};
-push @targets, ['MariaDB/MySQL', { url => $ENV{YGGDRASIL_TEST_MYSQL} }] if $ENV{YGGDRASIL_TEST_MYSQL};
+push @targets, ['MariaDB/MySQL', { url => $ENV{YGGDRASIL_TEST_MYSQL},
+  options => $ENV{YGGDRASIL_TEST_MYSQL_TLS} ? { mysql_ssl => 1 } : {} }] if $ENV{YGGDRASIL_TEST_MYSQL};
 
 sub manager { Yggdrasil->new(connections => { default => $_[0], alternate => $sqlite }, model_namespaces => ['Fixture::Model']) }
 sub build_schema {

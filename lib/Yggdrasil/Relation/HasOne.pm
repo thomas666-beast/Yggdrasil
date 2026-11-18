@@ -6,10 +6,8 @@ sub results { $_[0]->first }
 
 sub eager_load {
   my ($s, $models, $name, $cb) = @_;
-  local $s->{_cb} = $cb;
-  my $by = $s->_group($models);
-  my $lk = $s->local_key;
-  $_->set_relation($name, ($by->{$_->attributes->{$lk} // ''} // [])->[0]) for @$models;
+  my ($by, $local) = $s->_group($models, $cb);
+  $_->set_relation($name, $s->_group_for($by, $_, $local)->[0]) for @$models;
 }
 
 1;

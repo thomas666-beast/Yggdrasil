@@ -6,7 +6,8 @@ use Yggdrasil;
 
 my @targets = (['SQLite', { driver => 'sqlite', database => ':memory:' }]);
 push @targets, ['PostgreSQL', { url => $ENV{YGGDRASIL_TEST_PG} }] if $ENV{YGGDRASIL_TEST_PG};
-push @targets, ['MariaDB/MySQL', { url => $ENV{YGGDRASIL_TEST_MYSQL} }] if $ENV{YGGDRASIL_TEST_MYSQL};
+push @targets, ['MariaDB/MySQL', { url => $ENV{YGGDRASIL_TEST_MYSQL},
+  options => $ENV{YGGDRASIL_TEST_MYSQL_TLS} ? { mysql_ssl => 1 } : {} }] if $ENV{YGGDRASIL_TEST_MYSQL};
 
 sub write_seed {
   my ($file, $body) = @_;

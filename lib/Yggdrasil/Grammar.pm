@@ -66,6 +66,7 @@ sub compile_select {
   my @p = ('select ' . ($q->is_distinct ? 'distinct ' : '')
     . ($cols && @$cols ? CORE::join(', ', map { $s->column($_, $bind) } @$cols) : '*'));
   push @p, 'from ' . $s->wrap($q->from);
+  push @$bind, @{$q->_from_bindings};
   push @p, $s->compile_joins($q, $bind) if @{$q->joins};
   my $w = $s->query_where($q, $bind);
   push @p, "where $w" if length $w;

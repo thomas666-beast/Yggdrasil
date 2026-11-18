@@ -2,7 +2,7 @@ package Yggdrasil::Model;
 use Moo;
 use Carp ();
 use JSON::PP ();
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed refaddr);
 use Yggdrasil;
 use Yggdrasil::Query;
 use Yggdrasil::Util qw(class_basename snake_case pluralize uniq now_string);
@@ -25,6 +25,7 @@ has pivot      => (is => 'rw');
 has using      => (is => 'rw');          # per-instance connection name
 has _bound_manager    => (is => 'rw');
 has _bound_connection => (is => 'rw');
+has _relation_probe => (is => 'ro');
 
 # User->new({ name => 'x' }) mass-assigns (respecting fillable/guarded);
 # User->new(attributes => {...}, ...) is the plain Moo constructor.
@@ -53,7 +54,7 @@ sub deleted_at_column  { 'deleted_at' }
 sub soft_deletes       { 0 }
 sub connection_name    { undef }
 sub fillable           { [] }
-sub guarded            { [$_[0]->primary_key] }
+sub guarded            { [$_[0]->key_columns] }
 sub hidden             { [] }
 sub appends            { [] }
 sub casts              { +{} }
@@ -130,6 +131,16 @@ sub update_or_create {
   my $m = $class->query->where($search)->first;
   return $m ? $m->update($values) : $class->create({%$search, %{$values // {}}});
 }
+sub first_or_create_atomic {
+  my ($class, $identity, $values) = @_;
+  return $class->manager->first_or_create_model(ref($class) || $class, $identity, $values,
+    using => $class->connection->name);
+}
+sub update_or_create_atomic {
+  my ($class, $identity, $values) = @_;
+  return $class->manager->update_or_create_model(ref($class) || $class, $identity, $values,
+    using => $class->connection->name);
+}
 sub destroy {
   my ($class, @ids) = @_;
   @ids = map { ref $_ eq 'ARRAY' ? @$_ : $_ } @ids;
@@ -193,7 +204,21 @@ sub force_fill {
   return $s;
 }
 
-sub get_key { $_[0]->attributes->{$_[0]->primary_key} }
+sub key_columns {
+  my $key = $_[0]->primary_key;
+  my @cols = ref $key eq 'ARRAY' ? @$key : ($key);
+  my %seen;
+  Carp::croak('Yggdrasil: primary_key must name distinct columns')
+    if !@cols || grep { !defined $_ || ref $_ || !/\A[A-Za-z_][A-Za-z_0-9]*\z/ || $seen{$_}++ } @cols;
+  return @cols;
+}
+
+sub get_key {
+  my $s = shift;
+  my @cols = $s->key_columns;
+  return $s->attributes->{$cols[0]} if @cols == 1;
+  return +{ map { $_ => $s->attributes->{$_} } @cols };
+}
 
 sub _differs {
   my ($a, $b) = @_;
@@ -223,10 +248,18 @@ sub _table_query { $_[0]->connection->table($_[0]->table) }
 
 sub _stored_key {
   my $s = shift;
-  my $key = $s->original->{$s->primary_key};
-  Carp::croak('Yggdrasil: model operation requires a stored primary key') unless $s->in_storage && defined $key;
-  Carp::croak('Yggdrasil: cannot change the primary key of a stored model') if _differs($key, $s->get_key);
-  return $key;
+  my @cols = $s->key_columns;
+  Carp::croak('Yggdrasil: model operation requires a stored primary key')
+    if !$s->in_storage || grep { !defined $s->original->{$_} || ref $s->original->{$_} } @cols;
+  Carp::croak('Yggdrasil: cannot change the primary key of a stored model')
+    if grep { _differs($s->original->{$_}, $s->attributes->{$_}) } @cols;
+  return @cols == 1 ? $s->original->{$cols[0]} : +{ map { $_ => $s->original->{$_} } @cols };
+}
+
+sub _stored_query {
+  my $s = shift;
+  my $key = $s->_stored_key;
+  return $s->_table_query->where(ref $key eq 'HASH' ? $key : { ($s->key_columns)[0] => $key });
 }
 
 sub save {
@@ -246,8 +279,14 @@ sub _perform_insert {
     $s->attributes->{$_} //= $now for $s->created_at_column, $s->updated_at_column;
   }
   my $attrs = {%{$s->attributes}};
-  my $pk = $s->primary_key;
-  if ($s->incrementing && !defined $attrs->{$pk}) {
+  my @cols = $s->key_columns;
+  my $pk = $cols[0];
+  if (@cols > 1) {
+    Carp::croak('Yggdrasil: inserts require every composite primary key value')
+      if grep { !defined $attrs->{$_} || ref $attrs->{$_} } @cols;
+    $s->_table_query->insert($attrs);
+  }
+  elsif ($s->incrementing && !defined $attrs->{$pk}) {
     CORE::delete $attrs->{$pk};
     $s->attributes->{$pk} = $s->_table_query->insert_get_id($attrs, $pk);
   }
@@ -264,8 +303,7 @@ sub _perform_update {
     $s->attributes->{$s->updated_at_column} = $s->now;
   }
   my $dirty = $s->get_dirty;
-  my $key = $s->_stored_key;
-  $s->_table_query->where($s->primary_key, $key)->update($dirty);
+  $s->_stored_query->update($dirty);
   $s->updated;
 }
 
@@ -287,8 +325,8 @@ sub _incr {
   my ($s, $sign, $col, $n, $extra) = @_;
   $n //= 1;
   Carp::croak('Yggdrasil: cannot change the primary key of a stored model')
-    if $col eq $s->primary_key || (defined $extra && exists $extra->{$s->primary_key});
-  my $q = $s->_table_query->where($s->primary_key, $s->_stored_key);
+    if grep { $col eq $_ || (defined $extra && exists $extra->{$_}) } $s->key_columns;
+  my $q = $s->_stored_query;
   $sign > 0 ? $q->increment($col, $n, $extra) : $q->decrement($col, $n, $extra);
   $s->attributes->{$col} = ($s->attributes->{$col} // 0) + $sign * $n;
   $s->attributes->{$_} = $extra->{$_} for keys %{$extra // {}};
@@ -307,14 +345,14 @@ sub delete {
 
 sub _hard_delete {
   my $s = shift;
-  $s->_table_query->where($s->primary_key, $s->_stored_key)->force_delete;
+  $s->_stored_query->force_delete;
   $s->in_storage(0);
 }
 sub _do_delete { $_[0]->_hard_delete }
 
 sub refresh {
   my $s = shift;
-  my $row = $s->_table_query->where($s->primary_key, $s->_stored_key)->first
+  my $row = $s->_stored_query->first
     or Yggdrasil::Exception->throw(message => 'Cannot refresh: row no longer exists', type => 'model_not_found');
   $s->attributes({%$row});
   $s->original({%$row});
@@ -329,7 +367,7 @@ sub fresh {
 
 sub replicate {
   my ($s, @except) = @_;
-  push @except, $s->primary_key, $s->created_at_column, $s->updated_at_column;
+  push @except, $s->key_columns, $s->created_at_column, $s->updated_at_column;
   my %a = %{$s->attributes};
   CORE::delete @a{@except};
   my $m = (ref $s)->new;
@@ -359,19 +397,23 @@ sub TO_JSON { $_[0]->to_hash }
 # ---- relations -------------------------------------------------------------------------------------------------
 
 sub _fk_for { snake_case(class_basename(ref($_[0]) || $_[0])) . '_id' }
+sub _relation_pk {
+  my @cols = $_[0]->key_columns;
+  return @cols == 1 ? $cols[0] : \@cols;
+}
 
 sub has_one {
   my ($s, $related, $fk, $lk) = @_;
   return Yggdrasil::Relation::HasOne->new(
     parent => $s, related => $s->manager->model($related),
-    foreign_key => $fk // $s->_fk_for, local_key => $lk // $s->primary_key);
+    foreign_key => $fk // $s->_fk_for, local_key => $lk // $s->_relation_pk);
 }
 
 sub has_many {
   my ($s, $related, $fk, $lk) = @_;
   return Yggdrasil::Relation::HasMany->new(
     parent => $s, related => $s->manager->model($related),
-    foreign_key => $fk // $s->_fk_for, local_key => $lk // $s->primary_key);
+    foreign_key => $fk // $s->_fk_for, local_key => $lk // $s->_relation_pk);
 }
 
 sub belongs_to {
@@ -379,19 +421,21 @@ sub belongs_to {
   my $class = $s->manager->model($related);
   return Yggdrasil::Relation::BelongsTo->new(
     parent => $s, related => $class,
-    foreign_key => $fk // $class->_fk_for, owner_key => $owner // $class->primary_key);
+    foreign_key => $fk // $class->_fk_for, owner_key => $owner // $class->_relation_pk);
 }
 
 sub belongs_to_many {
   my ($s, $related, $pivot, $fpk, $rpk, $pk, $rk) = @_;
   my $class = $s->manager->model($related);
+  $pk //= $s->_relation_pk;
+  $rk //= $class->_relation_pk;
   return Yggdrasil::Relation::BelongsToMany->new(
     parent => $s, related => $class,
     pivot_table       => $pivot // CORE::join('_', sort { $a cmp $b } map { snake_case(class_basename($_)) } (ref $s, $class)),
     foreign_pivot_key => $fpk // $s->_fk_for,
     related_pivot_key => $rpk // $class->_fk_for,
-    parent_key        => $pk // $s->primary_key,
-    related_key       => $rk // $class->primary_key);
+    parent_key        => $pk,
+    related_key       => $rk);
 }
 
 sub set_relation    { $_[0]->relations->{$_[1]} = $_[2]; $_[0] }
@@ -401,9 +445,19 @@ sub relation_loaded { exists $_[0]->relations->{$_[1]} ? 1 : 0 }
 sub related {
   my ($s, $name) = @_;
   return $s->relations->{$name} if exists $s->relations->{$name};
-  my $rel = $s->$name;
-  Carp::croak(qq{"$name" is not a relation on } . ref $s) unless blessed $rel && $rel->isa('Yggdrasil::Relation');
+  my $rel = $s->_resolve_relation($name);
   return $s->relations->{$name} = $rel->results;
+}
+
+sub _resolve_relation {
+  my ($s, $name) = @_;
+  my $method = defined $name && $name =~ /\A[A-Za-z_][A-Za-z_0-9]*\z/ ? $s->can($name) : undef;
+  my $base = $method ? __PACKAGE__->can($name) : undef;
+  Carp::croak(qq{"$name" is not a relation on } . ref $s)
+    unless $method && (!$base || refaddr($base) != refaddr($method));
+  my $rel = $s->$method;
+  Carp::croak(qq{"$name" is not a relation on } . ref $s) unless blessed $rel && $rel->isa('Yggdrasil::Relation');
+  return $rel;
 }
 
 sub load {
@@ -415,21 +469,25 @@ sub load {
 sub eager_load_relations {
   my ($class, $models, $specs) = @_;
   return unless @$models;
-  my %done;
+  my (%tree, @order);
   for my $spec (@$specs) {
     my ($name, $cb) = @$spec;
     my ($first, $rest) = split /\./, $name, 2;
-    unless ($done{$first}++) {
-      my $rel = $models->[0]->$first;
-      Carp::croak(qq{"$first" is not a relation on } . ref $models->[0]) unless blessed $rel && $rel->isa('Yggdrasil::Relation');
-      $rel->eager_load($models, $first, defined $rest ? undef : $cb);
-    }
-    next unless defined $rest;
+    push @order, $first unless exists $tree{$first};
+    my $entry = $tree{$first} //= { nested => [] };
+    if (defined $rest) { push @{$entry->{nested}}, [$rest, $cb] }
+    elsif (defined $cb) { $entry->{callback} = $cb }
+  }
+  for my $first (@order) {
+    my $entry = $tree{$first};
+    my $rel = $models->[0]->_resolve_relation($first);
+    $rel->eager_load($models, $first, $entry->{callback});
+    next unless @{$entry->{nested}};
     my @related = map {
       my $r = $_->relations->{$first};
       !defined $r ? () : blessed $r && $r->isa('Yggdrasil::Collection') ? @$r : ($r);
     } @$models;
-    $related[0]->eager_load_relations(\@related, [[$rest, $cb]]) if @related;
+    $related[0]->eager_load_relations(\@related, $entry->{nested}) if @related;
   }
   return;
 }
@@ -438,8 +496,8 @@ sub eager_load_relations {
 
 for my $m (qw(
   where or_where where_in where_not_in where_null where_not_null where_between where_raw where_column
-  where_exists select group_by having order_by order_by_desc latest oldest limit offset take skip include
-  join left_join first find find_or_fail first_or_fail count sum avg min max pluck value paginate cursor_page chunk
+  where_exists where_has or_where_has where_doesnt_have select group_by having order_by order_by_desc latest oldest limit offset take skip include
+  join left_join first find find_or_fail first_or_fail count sum avg min max pluck value paginate cursor_page chunk chunk_by_cursor
   lock_for_update distinct when tap truncate insert upsert insert_or_ignore
 )) {
   no strict 'refs';

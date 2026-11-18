@@ -14,6 +14,7 @@ has connection => (is => 'ro', required => 1);
 has manager    => (is => 'ro');
 has model      => (is => 'rw');
 has _from      => (is => 'rw', init_arg => 'from');
+has _from_bindings => (is => 'rw', default => sub { [] });
 has columns    => (is => 'rw');
 has _distinct  => (is => 'rw', init_arg => 'distinct');
 has joins      => (is => 'rw', default => sub { [] });
@@ -40,6 +41,7 @@ sub clone {
   my $s = shift;
   return (ref $s)->new(
     connection => $s->connection, manager => $s->manager, model => $s->model, from => $s->from,
+    _from_bindings => [@{$s->_from_bindings}],
     columns => ($s->columns ? [@{$s->columns}] : undef), distinct => $s->is_distinct,
     joins => [@{$s->joins}], wheres => [@{$s->wheres}], groups => [@{$s->groups}],
     havings => [@{$s->havings}], orders => [@{$s->orders}],
@@ -164,6 +166,42 @@ sub _where_exists {
 sub where_exists     { $_[0]->_where_exists($_[1], 'and', 0) }
 sub where_not_exists { $_[0]->_where_exists($_[1], 'and', 1) }
 
+sub _where_relation {
+  my ($s, $name, $cb, $bool, $not) = @_;
+  my $class = $s->model;
+  Carp::croak('Yggdrasil: where_has requires a model query') unless $class && $s->manager;
+  Carp::croak('Yggdrasil: where_has expects a dotted relation name and optional callback')
+    if !defined $name || ref $name || $name !~ /\A[A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_][A-Za-z_0-9]*)*\z/
+       || (defined $cb && ref $cb ne 'CODE');
+  my ($first, $rest) = split /\./, $name, 2;
+  my $outer = $s->from;
+  Carp::croak('Yggdrasil: where_has requires the model table as its query source') unless $outer eq $class->table;
+  my $probe = $class->new(_bound_manager => $s->manager, _bound_connection => $s->connection,
+    using => $s->connection->name, _relation_probe => 1);
+  my $rel = $probe->_resolve_relation($first);
+  my $inner = $rel->query->clone;
+  Carp::croak('Yggdrasil: where_has cannot query across connections')
+    unless refaddr($inner->connection) == refaddr($s->connection);
+  if (defined $rest) { $inner->where_has($rest, $cb) }
+  elsif ($cb) { $cb->($inner) }
+  Carp::croak('Yggdrasil: where_has does not accept grouped, limited, offset or locking relation queries')
+    if @{$inner->groups} || @{$inner->havings} || defined $inner->get_limit || defined $inner->get_offset || $inner->get_lock;
+  Carp::croak('Yggdrasil: where_has requires the related model table as its query source')
+    unless !ref($inner->from) && $inner->from eq $rel->related->table;
+  my ($sql, $bind) = $inner->select($inner->from . '.*')->reorder->compile;
+  my $alias = '__yggdrasil_related';
+  my $from = '(' . $sql . ') as ' . $s->grammar->wrap($alias);
+  my $exists = $s->new_query->from(\$from)->select_raw('1');
+  # Bind values in the derived table before JOIN/WHERE bindings.
+  $exists->_from_bindings($bind);
+  $rel->_existence_link($exists, $alias, $outer);
+  return $s->_where_exists($exists, $bool, $not);
+}
+
+sub where_has         { $_[0]->_where_relation($_[1], $_[2], 'and', 0) }
+sub or_where_has      { $_[0]->_where_relation($_[1], $_[2], 'or', 0) }
+sub where_doesnt_have { $_[0]->_where_relation($_[1], $_[2], 'and', 1) }
+
 sub when {
   my ($s, $cond, $cb, $else) = @_;
   if ($cond) { $cb->($s, $cond) } elsif ($else) { $else->($s, $cond) }
@@ -277,12 +315,50 @@ sub get {
   my $m = $s->model;
   if (@cols) { $q = $s->clone->select(@cols) }
   elsif ($m && @{$s->joins} && !$s->columns) { $q = $s->clone->select($s->from . '.*') }
-  my $rows = $q->_rows;
+  return $s->_materialize($q->_rows);
+}
+
+sub _materialize {
+  my ($s, $rows) = @_;
+  my $m = $s->model;
   return Yggdrasil::Collection->_from_array($rows) unless $m;
   my $conn = $s->connection->name;
   my @items = map { $m->_hydrate($_, $conn, $s->connection, $s->manager) } @$rows;
   $m->eager_load_relations(\@items, $s->eager) if @items && @{$s->eager};
   return Yggdrasil::Collection->_from_array(\@items);
+}
+
+sub _eager_batch {
+  my ($s, $partition, $parent_count) = @_;
+  my ($limit, $offset) = ($s->get_limit, $s->get_offset // 0);
+  return [] if defined $limit && !$limit;
+  return $s->get if !defined $limit && !$offset;
+  Carp::croak('Yggdrasil: per-parent offset requires a limit') unless defined $limit;
+  Carp::croak('Yggdrasil: per-parent limits require a non-grouped, non-distinct, unlocked relationship query')
+    if $s->is_distinct || @{$s->groups} || @{$s->havings} || $s->get_lock;
+  Carp::croak('Yggdrasil: per-parent limits require column-based ordering')
+    if grep { !exists $_->{column} || ref $_->{column} || $_->{column} !~ /\A(?:[A-Za-z_][A-Za-z_0-9]*\.)*[A-Za-z_][A-Za-z_0-9]*\z/ } @{$s->orders};
+  if ($parent_count == 1) {
+    my $ordered = $s->clone;
+    $ordered->order_by($s->from . ".$_") for $s->model->key_columns;
+    return $ordered->get;
+  }
+  my $g = $s->grammar;
+  my $inner = $s->clone->limit(undef)->offset(undef)->reorder;
+  $inner->select($s->from . '.*') unless $inner->columns && @{$inner->columns};
+  my @sort = map { $g->wrap($_->{column}) . ' ' . $_->{direction} } @{$s->orders};
+  push @sort, map { $g->wrap($s->from . ".$_") . ' asc' } $s->model->key_columns;
+  my $rank = $g->wrap('__yggdrasil_rank');
+  my $window = 'row_number() over (partition by ' . $g->columnize($partition)
+    . ' order by ' . CORE::join(', ', @sort) . ") as $rank";
+  my ($sql, $bind) = $inner->select_raw($window)->compile;
+  my $alias = $g->wrap('__yggdrasil_window');
+  my $rows = $s->connection->select_all(
+    "select * from ($sql) as $alias where $rank > (? + 0.0) and $rank <= (? + 0.0) order by $rank",
+    @$bind, $offset, $offset + $limit,
+  );
+  CORE::delete $_->{__yggdrasil_rank} for @$rows;
+  return $s->_materialize($rows);
 }
 
 sub first {
@@ -291,17 +367,45 @@ sub first {
   return $s->clone->limit(1)->get(@cols)->first;
 }
 
-sub _pk_col {
+sub _pk_columns {
   my $s = shift;
-  return ($s->model->table . '.' . $s->model->primary_key) if $s->model;
-  return 'id';
+  return $s->model ? $s->model->key_columns : 'id';
+}
+
+sub _key_filter {
+  my ($s, $id) = @_;
+  my @cols = $s->_pk_columns;
+  my @qualified = $s->model ? map { $s->model->table . ".$_" } @cols : @cols;
+  if (@cols == 1) {
+    Carp::croak('Yggdrasil: expected a scalar primary key') if !defined $id || ref $id;
+    return sub { $_[0]->where($qualified[0], $id) };
+  }
+  Carp::croak('Yggdrasil: expected a hashref with all and only the composite primary key columns')
+    unless ref $id eq 'HASH' && keys(%$id) == @cols && !grep { !defined $id->{$_} || ref $id->{$_} } @cols;
+  my @values = @{$id}{@cols};
+  return sub {
+    my $q = shift;
+    $q->where($qualified[$_], $values[$_]) for 0 .. $#cols;
+  };
 }
 
 sub find {
   my ($s, $id) = @_;
   return undef unless defined $id;
-  return $s->clone->_and_constraint(sub { $_[0]->where_in($s->_pk_col, $id) })->get if ref $id eq 'ARRAY';
-  return $s->clone->_and_constraint(sub { $_[0]->where($s->_pk_col, $id) })->first;
+  if (ref $id eq 'ARRAY') {
+    my @cols = $s->_pk_columns;
+    if (@cols == 1) {
+      my $col = $s->model ? $s->model->table . ".$cols[0]" : $cols[0];
+      return $s->clone->_and_constraint(sub { $_[0]->where_in($col, $id) })->get;
+    }
+    return Yggdrasil::Collection->new unless @$id;
+    my $max = int(500 / @cols);
+    $max = 100 if $max > 100;
+    Carp::croak("Yggdrasil: find accepts at most $max composite keys per call") if @$id > $max;
+    my @keys = map { $s->_key_filter($_) } @$id;
+    return $s->clone->_and_constraint(sub { my $q = shift; $q->or_where($_) for @keys })->get;
+  }
+  return $s->clone->_and_constraint($s->_key_filter($id))->first;
 }
 
 sub find_or_fail {
@@ -309,7 +413,8 @@ sub find_or_fail {
   my $r = $s->find($id);
   return $r if defined $r;
   my $m = $s->model // 'table ' . $s->from;
-  Yggdrasil::Exception->throw(message => "No query results for $m [" . ($id // 'undef') . ']', type => 'model_not_found', model => $s->model);
+  my $key = defined $id && !ref $id ? " [$id]" : '';
+  Yggdrasil::Exception->throw(message => "No query results for $m$key", type => 'model_not_found', model => $s->model);
 }
 
 sub first_or_fail {
@@ -442,6 +547,21 @@ sub chunk {
   return $s;
 }
 
+sub chunk_by_cursor {
+  my ($s, $cb, %opts) = @_;
+  Carp::croak('Yggdrasil: chunk_by_cursor expects a callback') unless ref $cb eq 'CODE';
+  my $page_no = 0;
+  while (1) {
+    my $page = $s->cursor_page(%opts);
+    last unless @{$page->items};
+    my $next = $page->next_cursor;
+    my $keep_going = $cb->($page->items, ++$page_no);
+    last if !defined $next || (defined $keep_going && !ref $keep_going && $keep_going eq '0');
+    $opts{after} = $next;
+  }
+  return $s;
+}
+
 # ---- writing --------------------------------------------------------------------------------------
 
 sub _rows_arg {
@@ -474,7 +594,9 @@ sub insert_or_ignore {
 
 sub insert_get_id {
   my ($s, $row, $pk) = @_;
-  $pk //= $s->model ? $s->model->primary_key : 'id';
+  my @cols = $s->_pk_columns;
+  Carp::croak('Yggdrasil: insert_get_id does not support composite keys; use insert or create_model') if @cols > 1;
+  $pk //= $cols[0];
   my $r = $s->_rows_arg($row)->[0];
   my @b;
   my $sql = $s->grammar->compile_insert_get_id($s, $r, \@b, $pk);
@@ -545,7 +667,7 @@ sub truncate {
   *{__PACKAGE__ . '::each'}   = sub { my ($s, $cb, $size) = @_; $s->chunk($size || 500, sub { $cb->($_) for @{$_[0]}; 1 }) };
   *{__PACKAGE__ . '::delete'} = sub {
     my ($s, $id) = @_;
-    $s = $s->clone->_and_constraint(sub { $_[0]->where($s->_pk_col, $id) }) if defined $id;
+    $s = $s->clone->_and_constraint($s->_key_filter($id)) if @_ > 1;
     my $m = $s->model;
     return $s->update({ $m->deleted_at_column => $m->now }) if $m && $m->soft_deletes;
     return $s->force_delete;

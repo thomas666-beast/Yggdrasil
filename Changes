@@ -1,3 +1,17 @@
+0.05  Bounded relationship loading and concurrency
+      - Apply eager-load limits and offsets per parent, including compound pivots.
+      - Add nested where_has, or_where_has, and where_doesnt_have.
+      - Support composite many-to-many keys and transactional sync.
+      - Add opt-in atomic create/update by unique model identity.
+      - Serialize migration writers across sessions and add read-only schema import.
+      - Add a four-engine CI matrix, user guide, and top-N benchmark.
+
+0.04  Composite identities and cursor batches
+      - Support multi-column model keys, guarded instance writes, and key lookups.
+      - Support multi-column has_one, has_many, and belongs_to including eager loading.
+      - Add chunk_by_cursor for bounded export and processing jobs.
+      - Benchmark an eager-loaded relationship payload against DBIx::Class.
+
 0.03  Seed data
       - Add standalone seeder scaffolding and execution by named connection.
       - Validate seed files before a batch and run its data writes in one transaction.

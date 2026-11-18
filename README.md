@@ -2,9 +2,11 @@
 
 Yggdrasil is a standalone, Eloquent-style Perl ORM for SQLite, PostgreSQL, MySQL and MariaDB. It includes a DBI query builder, Moo models, relationships, eager loading, soft deletes, a schema builder and file-based migrations. It does not require Mojolicious.
 
+See the [Yggdrasil 0.05 User Guide](USER-GUIDE.md) for per-parent eager loading, relationship filters, atomic writes, schema import, and the Skapa workflow.
+
 ## Install and run
 
-Install the release archive with `cpanm ./Yggdrasil-0.03.tar.gz`. Use the driver for your database: `DBD::SQLite` for `sqlite`, `DBD::Pg` for `pg`, `DBD::mysql` for `mysql`, or `DBD::MariaDB` for `mariadb`.
+Install the release archive with `cpanm ./Yggdrasil-0.05.tar.gz`. Use the driver for your database: `DBD::SQLite` for `sqlite`, `DBD::Pg` for `pg`, `DBD::mysql` for `mysql`, or `DBD::MariaDB` for `mariadb`. Install the Mojolicious Yggdrasil adapter 0.04 and Skapa CLI 0.03 if you want the new app commands.
 
 ```perl
 use strict;
@@ -52,6 +54,37 @@ Use `cursor_page` for next-page navigation without a total. It reads at most `si
 
 Use `order_by(...)->paginate($size, $page)` if clients need exact totals or arbitrary page numbers. `get` retrieves the full matching result unless bounded, and `chunk` still uses offsets. Eager loading fetches related rows only for visible parents, but a large to-many relationship can still return many child rows.
 
+For large exports, callbacks can consume bounded keyset batches without constructing the full result in memory:
+
+```perl
+$orm->model_query('Post')->chunk_by_cursor(sub {
+  my ($rows, $batch_number) = @_;
+  print $_->title, "\n" for @$rows;
+  return 1; # return 0 to stop early
+}, size => 250, order => ['id']);
+```
+
+The same cursor rules apply: use a stable, unique sort order backed by an index. Do not modify sort columns while iterating. This is batched processing, not a single database cursor or a consistent snapshot by default.
+
+## Composite keys
+
+Existing models keep serving single-key calls such as `$q->find(42)`. To model a table that actually declares `PRIMARY KEY (tenant_id, invoice_no)`, opt in:
+
+```perl
+package MyApp::Model::Invoice;
+use Moo;
+extends 'Yggdrasil::Model';
+
+sub primary_key { [qw(tenant_id invoice_no)] }
+# Allow only these attributes when assigning from trusted application data.
+sub fillable { [qw(tenant_id invoice_no total)] }
+sub lines { shift->has_many('InvoiceLine', [qw(tenant_id invoice_no)]) }
+```
+
+Create records with every key column supplied; Yggdrasil does not generate parts of a composite key. `$orm->model_query('Invoice')->find({ tenant_id => 7, invoice_no => 42 })` matches the entire key. A list of key hashes works for small batch reads, up to 100 tuples and 500 key binds per call. `get_key` returns a hash reference for a composite model and a scalar for a single-key model. A stored instance needs all key columns selected before it can be modified and cannot change its primary key in place.
+
+`has_one`, `has_many`, and `belongs_to` accept ordered arrays of columns. The two lists must have the same length and pair columns in order; omit the local or owner list to use the model’s primary key. Include matching columns when restricting projections, and use comparable persisted values on both sides of a relation. `belongs_to_many` also accepts composite pivot keys; see the guide for an example with a shared tenant column.
+
 ## Seed data
 
 Configure the manager with `seed_paths => { main => ['seeds'] }` for a connection named `main`, or pass `paths => ['seeds']` to `$orm->seeder('main', paths => ['seeds'])`. Generate a starter file with `$orm->seeder('main')->make('RolesSeeder')` and replace its sample with your data. Its path will be `seeds/roles_seeder.pl`.
@@ -83,4 +116,4 @@ Run one file with `$orm->seeder('main')->run('RolesSeeder')`, or run all in file
 
 Run `prove -l t` for SQL generation and SQLite. To include live PostgreSQL and MariaDB or MySQL, set `YGGDRASIL_TEST_PG` and `YGGDRASIL_TEST_MYSQL` to disposable test databases. These suites drop tables.
 
-Install `DBIx::Class` and run `perl bench/sqlite.pl` for a local comparison of equivalent indexed lookups and a separate illustration of counted offset versus cursor paging. One workload does not establish general performance superiority.
+Install `DBIx::Class` and run `perl bench/sqlite.pl` for indexed lookups, a 25-parent relationship query with eight children per parent, and a separate illustration of counted offset versus cursor paging. The relationship benchmark verifies the same materialized payload before timing both ORMs. These workloads do not establish general performance superiority.

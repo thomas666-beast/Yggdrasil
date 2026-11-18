@@ -12,7 +12,7 @@ has query   => (is => 'lazy');
 sub _build_query {
   my $s = shift;
   my $q = $s->_related_query;
-  $q->_and_constraint(sub { $s->add_constraints($_[0]) });
+  $q->_and_constraint(sub { $s->add_constraints($_[0]) }) unless $s->parent->_relation_probe;
   return $q;
 }
 
@@ -25,6 +25,7 @@ sub _related_query {
 }
 
 sub add_constraints { }
+sub _existence_link { Carp::croak('Yggdrasil: where_has does not support this relation type') }
 sub _post { }                     # hook: post-process loaded models (arrayref)
 
 sub get {
@@ -51,7 +52,7 @@ sub _fetch_in {
     $prepare->($q) if $prepare;
     $q->_and_constraint(sub { $_[0]->where_in($column, \@chunk) });
     $cb->($q) if $cb;
-    push @all, @{$q->get};
+    push @all, @{$q->_eager_batch([$column], scalar @chunk)};
   }
   return \@all;
 }
@@ -60,6 +61,65 @@ sub _keys {
   my ($s, $models, $attr) = @_;
   my %seen;
   return [grep { defined $_ && !$seen{$_}++ } map { $_->attributes->{$attr} } @$models];
+}
+
+sub _key_pair {
+  my ($s, $left, $right) = @_;
+  my @pair = map { ref $_ eq 'ARRAY' ? [@$_] : [$_] } ($left, $right);
+  for my $cols (@pair) {
+    my %seen;
+    Carp::croak('Yggdrasil: relationship keys must name distinct columns')
+      if !@$cols || grep { !defined $_ || ref $_ || !/\A[A-Za-z_][A-Za-z_0-9]*\z/ || $seen{$_}++ } @$cols;
+  }
+  Carp::croak('Yggdrasil: relationship needs matching foreign and local key columns')
+    unless @{$pair[0]} == @{$pair[1]};
+  return @pair;
+}
+
+sub _tuple {
+  my ($s, $model, $cols) = @_;
+  my @values = @{$model->attributes}{@$cols};
+  return undef if grep { !defined $_ || ref $_ } @values;
+  return \@values;
+}
+
+# Length prefixes prevent collisions between tuples with delimiter-like values.
+sub _tuple_key { CORE::join('', map { length($_) . ':' . $_ } @{$_[1]}) }
+
+sub _where_tuple {
+  my ($s, $q, $cols, $tuple) = @_;
+  return $q->where_raw('0 = 1') unless defined $tuple;
+  $q->where($cols->[$_], $tuple->[$_]) for 0 .. $#$cols;
+  return $q;
+}
+
+sub _fetch_tuples {
+  my ($s, $models, $from, $to, $cb, $prepare, $target) = @_;
+  $target //= $s->related->table;
+  my @qualified = map { "$target.$_" } @$to;
+  if (@qualified == 1) {
+    return $s->_fetch_in($qualified[0], $s->_keys($models, $from->[0]), $cb, $prepare);
+  }
+  my (@tuples, %seen, @all);
+  for my $model (@$models) {
+    my $tuple = $s->_tuple($model, $from) // next;
+    push @tuples, $tuple unless $seen{$s->_tuple_key($tuple)}++;
+  }
+  my $batch = int(500 / @qualified) || 1;
+  $batch = 100 if $batch > 100;
+  while (my @part = splice @tuples, 0, $batch) {
+    my $q = $s->_related_query;
+    $prepare->($q) if $prepare;
+    $q->_and_constraint(sub {
+      my $filter = shift;
+      for my $tuple (@part) {
+        $filter->or_where(sub { $s->_where_tuple($_[0], \@qualified, $tuple) });
+      }
+    });
+    $cb->($q) if $cb;
+    push @all, @{$q->_eager_batch(\@qualified, scalar @part)};
+  }
+  return \@all;
 }
 
 sub AUTOLOAD {
